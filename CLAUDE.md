@@ -17,6 +17,13 @@ unrelated harmful requests?**
 This is a proof of concept, not a paper. Its only job is to answer *proceed* or *stop*.
 A clean "no effect" delivered in two days is a success, not a failure.
 
+> **Before acting on §3 to §7, read §11.** Several parameters in this brief have been
+> settled differently since it was written, with reasons: the battery is n=250 per arm
+> rather than 120, the primary judge is the three-way rubric rather than WildGuard, and
+> the inert control has been measured and is **not** behaviourally inert. §11 records
+> what changed and why. The registered predictions in §1 are frozen and are not to be
+> revised. Operational state and the exact command sequence live in `RUNBOOK.md`.
+
 ---
 
 ## 1. The claim, and honest reasons it might be wrong
@@ -467,3 +474,85 @@ that file was not read off the dashboard, it does not belong there.
 - Which branch of §8 fired, stated in one sentence.
 
 If the branch is "dead," write that word.
+
+---
+
+## 11. Measured facts and settled deviations
+
+Everything above this line was written before any data existed. Everything below was
+measured, and where it contradicts §3 to §7 it wins. Nothing here revises §1.
+
+Full numbers and reasoning: `results/day1_base_rates.md`. Commands and state:
+`RUNBOOK.md`.
+
+### 11.1 Settled deviations from the original brief
+
+| § | Brief said | Settled at | Why |
+|---|---|---|---|
+| 3 | 120 prompts per arm | **250 per arm** | At n=120 a 5-point shift is ~6/0 discordant pairs, McNemar p≈0.06 — the §8.4 threshold would not have been decidable at its own significance bar. At n=250 it is 19/6, p≈0.015. Free: StrongREJECT has 313 prompts, XSTest-safe has exactly 250. |
+| 3 | Primary judge: WildGuard | **Primary: rubric** (Qwen2.5-32B-AWQ, XSTest three-way) | It is the only judge that emits PARTIAL natively, so the §3 label schema and the PARTIAL-collapse sensitivity check come from one instrument rather than being split across two. WildGuard runs on every rollout as an independent binary check; Llama-Guard stays harmful-arm only, answering the harm question. |
+| 5 | — | **vLLM pinned exactly at 0.28.0** | The engine is part of the apparatus. A `uv sync` that moves it between the Day 1 gates and the Day 2 sweep invalidates the gates exactly as changing `max_num_seqs` would. Moving it requires re-running every gate. |
+
+### 11.2 The inert control is not behaviourally inert
+
+Measured, both models, both arms, greedy, rubric judge:
+
+| model | arm | `none` | `inert_k0` | shift |
+|---|---|---:|---:|---:|
+| llama31_8b | harmful | 99.6% | 99.6% | +0.0 |
+| llama31_8b | safe | 16.0% | 34.0% | **+18.0** |
+| qwen25_7b | harmful | 98.4% | 98.0% | −0.4 |
+| qwen25_7b | safe | 6.8% | 75.2% | **+68.4** |
+
+`inert.md` was built to §3's specification — every procedural instruction replaced with
+descriptive prose, length-matched to ±5% — and it still moves Qwen's benign-arm refusal
+rate by 68 points.
+
+This **vindicates the design**: §3 makes `inert`, not `none`, the primary comparison, and
+without it up to 68 points of pure skill-presence artefact would have been booked to the
+optimizer. It also introduces a mechanism that is not in §1's list of ways this could
+fail: **scope deflection.** A table-QA skill in the system message makes unrelated benign
+requests read as out-of-scope, and the model declines. Under the §3 schema that is
+correctly REFUSAL, and it is indistinguishable in the label from a safety over-refusal.
+
+**Consequence for §3's interpretation table.** That table's "harmful drops, benign flat →
+selective guardrail erosion" row assumes the benign arm measures over-refusal in the
+safety sense. If the safe arm's REFUSAL mass is mostly scope deflection, "benign flat"
+may only mean the model's sense of its own job did not change — which says nothing about
+guardrails, and makes the finding row and the null row indistinguishable. Do not read a
+Day 2 result through that table until the decomposition in `RUNBOOK.md` §3.2 is done.
+`src/judge.py` already records an `attempt` head on every rollout for exactly this; it
+has not been analysed.
+
+### 11.3 Qwen's partial rate makes the collapse choice load-bearing
+
+47.6% of Qwen's harmful-arm responses under `none` are partial refusals (llama: 1.6%).
+Qwen's baseline harmful refusal rate is therefore 98.4% collapsing PARTIAL→REFUSAL and
+50.8% collapsing PARTIAL→COMPLIANCE — a 47.6-point spread in the *baseline*, before any
+treatment. §3 already requires both collapses; for Qwen they are close to two different
+experiments and FINDINGS.md must say so rather than leave a reader to find it.
+
+The high partial rate is not a defect. It is evidence the three-way judge is catching the
+measured, partial engagement that §1 warned a binary detector would round to one side.
+The defect would be reporting one collapse and not the other.
+
+### 11.4 The two families are not comparable at baseline
+
+Skill-presence effect on the safe arm: +18.0 pp (llama) against +68.4 pp (qwen), on
+identical text. Harmful-arm partial rate: 1.6% against 47.6%. §8.4 requires the effect in
+both families; given baselines this different, per-model reporting is mandatory and any
+pooled number is misleading. A split result is a null under §8.5 regardless.
+
+### 11.5 A 200 OK is not evidence that anything worked
+
+Four instrument failures in one session, every one of them presenting as something else.
+The worst returned HTTP 200 with a clean exit code: vLLM removed the flat `guided_*`
+structured-output fields in v0.12.0, and because it accepts unknown request fields and
+only warns server-side, the primary judge silently became a free-text generator whose
+answers still looked plausible. It would have passed its own six-case smoke test by luck.
+
+Standing consequence, and it generalises past this one bug: **validate the instrument
+against a control that could fail, not against the transport.** `src/judge.py` now probes
+with sentinel strings the model cannot produce unprompted, before any verdict is counted,
+and preflights which model is actually on the port. `RUNBOOK.md` §4 lists all four with
+their fixes. When something in this pipeline looks fine, check that a control proves it.
