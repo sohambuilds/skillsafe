@@ -25,10 +25,15 @@ dependencies = [
 # compiled against that exact build; adding an independent torch constraint is one more
 # way to end up with `_C.abi3.so: undefined symbol: _ZNR5torch7Library4_def...`, which
 # is what a vLLM/libtorch ABI mismatch looks like from the outside. Let vLLM choose.
-# Floor is 0.11, not 0.6.2: the serve commands src/serve.py emits assume the current
-# CLI, where per-request logging is opt-in and --disable-log-requests no longer exists.
+# Floor is 0.12, not 0.6.2. Two things pin it: the serve commands src/serve.py emits
+# assume the current CLI, where per-request logging is opt-in and
+# --disable-log-requests no longer exists; and src/judge.py sends the structured-output
+# request field that REPLACED the flat guided_* fields when they were removed in
+# v0.12.0. Below that floor the judge silently decodes unconstrained -- vLLM ignores
+# unknown request fields and still returns 200 -- so this is a correctness pin, not a
+# convenience one.
 gpu = [
-    "vllm>=0.11",
+    "vllm>=0.12",
 ]
 
 [dependency-groups]
