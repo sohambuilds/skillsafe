@@ -289,6 +289,21 @@ class _Judge:
             self._preflight_result = {"base_url": self.base_url, "served": served}
             return self._preflight_result
 
+    async def aclose(self) -> None:
+        """Release the HTTP pool on the loop that opened it.
+
+        Each asyncio.run() builds a fresh event loop and closes it on the way out. An
+        AsyncOpenAI client still alive at that point has its httpx pool finalised later
+        by the garbage collector, against a loop that no longer exists -- which surfaces
+        as a wall of "RuntimeError: Event loop is closed" traces with a clean exit code
+        and fully-written output. Harmless in itself, but it buries the errors that do
+        matter, so close deterministically instead of leaving it to the collector.
+        """
+        try:
+            await self.client.close()
+        except Exception:  # teardown must never mask the real outcome
+            pass
+
     async def classify(self, prompt: str, response: str) -> dict:
         raise NotImplementedError
 
@@ -514,6 +529,13 @@ SMOKE_CASES = [
 
 async def smoke_test(judge_key: str) -> dict:
     judge = JUDGES[judge_key]()
+    try:
+        return await _smoke_cases(judge, judge_key)
+    finally:
+        await judge.aclose()
+
+
+async def _smoke_cases(judge, judge_key: str) -> dict:
     await judge.preflight()
     # Before the known-answer cases, not after. An unconstrained rubric judge can still
     # pass the cases by luck -- Qwen does often emit the bare label unprompted -- and
@@ -579,10 +601,6 @@ async def judge_file(path: Path, judge_keys: list[str], concurrency: int | None 
     arm = records[0].get("arm")
     keys = [k for k in judge_keys if not (k == "llamaguard" and arm != "harmful")]
     instances = {k: JUDGES[k]() for k in keys}
-    # All of them, up front. Judges are served one at a time on GPU 2, so "I forgot to
-    # start that one" is the expected failure -- and finding out after 90 records have
-    # been written is strictly worse than finding out now.
-    await asyncio.gather(*(j.preflight() for j in instances.values()))
     semaphore = asyncio.Semaphore(concurrency or config.CLIENT_CONCURRENCY)
 
     async def one(record: dict) -> None:
@@ -603,7 +621,15 @@ async def judge_file(path: Path, judge_keys: list[str], concurrency: int | None 
                     existing[key] = {"parse_ok": False, "parse_error": str(error)}
         record["judge"] = existing
 
-    await asyncio.gather(*(one(r) for r in records))
+    try:
+        # Preflight all of them up front. Judges are served one at a time on GPU 2, so
+        # "I forgot to start that one" is the expected failure -- and finding out after
+        # 90 records have been written is strictly worse than finding out now.
+        await asyncio.gather(*(j.preflight() for j in instances.values()))
+        await asyncio.gather(*(one(r) for r in records))
+    finally:
+        await asyncio.gather(*(j.aclose() for j in instances.values()),
+                             return_exceptions=True)
 
     tmp = path.with_suffix(".jsonl.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
@@ -868,9 +894,16 @@ def main() -> None:
         files = sorted((RUNS / "battery").glob("*.jsonl"))
         if not files:
             raise SystemExit("no battery runs under logs/runs/battery/")
-        for path in files:
-            summary = asyncio.run(judge_file(path, keys))
-            print(f"{path.name:<52} n={summary['n']:<5} {summary['judges']}")
+        async def judge_every() -> None:
+            # ONE event loop for the whole sweep, not one per file. asyncio.run() closes
+            # its loop on the way out, and any client still alive from an earlier
+            # iteration gets finalised against that dead loop by the collector -- which
+            # is what produced the "Event loop is closed" wall after a clean run.
+            for path in files:
+                summary = await judge_file(path, keys)
+                print(f"{path.name:<52} n={summary['n']:<5} {summary['judges']}")
+
+        asyncio.run(judge_every())
         return
 
     if args.make_validation_sample:

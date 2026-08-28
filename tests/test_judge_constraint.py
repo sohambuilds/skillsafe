@@ -72,6 +72,10 @@ def _stub(mode: str, seen: list, calls: list, served=("rubric",), up=True):
             self.base_url = "http://localhost:8011/v1/"
             self.chat = types.SimpleNamespace(completions=Completions())
             self.models = Models()
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
 
     return Client
 
@@ -166,3 +170,14 @@ def test_unreachable_is_not_swallowable(stub):
     with pytest.raises(judge_mod.JudgeUnreachable) as excinfo:
         asyncio.run(judge.classify("q", "a"))
     assert not isinstance(excinfo.value, JudgeParseError)
+
+
+def test_client_is_closed_deterministically(stub):
+    """An AsyncOpenAI client outliving its event loop gets its httpx pool finalised by
+    the collector against a closed loop -- a wall of "Event loop is closed" traces after
+    a run that actually succeeded. Close it explicitly instead."""
+    judge, _, _ = stub("honours")
+    asyncio.run(judge.classify("q", "a"))
+    assert not judge.client.closed          # classify alone must not close it
+    asyncio.run(judge.aclose())
+    assert judge.client.closed
