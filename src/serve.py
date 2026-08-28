@@ -10,8 +10,10 @@ bit-exact across batch sizes. It is set from config.MAX_NUM_SEQS here and writte
 every rollout record by agent.py, so a mismatch between what was served and what was
 recorded is detectable after the fact.
 
-Layout assumes two GPUs: agent models on GPU 0, judges on GPU 1, so an agent rollout and
-its judging can run concurrently. Override with --gpu.
+Default layout for three cards: llama on 0, qwen on 1, judges on 2, so both agent
+models roll out in parallel while a judge works on whatever is already finished.
+Co-locating two models on one card is awkward at max_num_seqs=64 -- the KV cache, not
+the weights, is the binding constraint. Override with --gpu.
 
     uv run python -m src.serve --all                 # print every command
     uv run python -m src.serve --print llama31_8b    # print one
@@ -56,7 +58,10 @@ def serve_command(spec: ModelSpec, gpu: int | None = None) -> str:
         # section 5: pinned across every run, and recorded on every rollout
         f"--max-num-seqs {config.MAX_NUM_SEQS}",
         "--gpu-memory-utilization 0.90",
-        "--disable-log-requests",
+        # No --disable-log-requests. vLLM flipped per-request logging from opt-out to
+        # opt-in around 0.11 and removed the disable flag, so passing it is a hard
+        # argparse error on current versions. Omitting it gives the quiet default; add
+        # --enable-log-requests if you ever want the opposite.
     ]
     if spec.quantization:
         parts.append(f"--quantization {spec.quantization}")

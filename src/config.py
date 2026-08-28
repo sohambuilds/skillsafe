@@ -52,7 +52,7 @@ AGENT_MODELS: dict[str, ModelSpec] = {
         quantization="awq_marlin",
         tokenizer_id="Qwen/Qwen2.5-7B-Instruct-AWQ",
         port=8002,
-        gpu=0,
+        gpu=1,
         max_model_len=8192,
     ),
 }
@@ -73,7 +73,7 @@ JUDGE_MODELS: dict[str, ModelSpec] = {
         quantization=None,  # bf16: the instrument is not quantized
         tokenizer_id="allenai/wildguard",
         port=8010,
-        gpu=1,
+        gpu=2,
         max_model_len=8192,
     ),
     # Three-way rubric judge, and the fallback if WildGuard is awkward to wire.
@@ -85,7 +85,7 @@ JUDGE_MODELS: dict[str, ModelSpec] = {
         quantization="awq_marlin",
         tokenizer_id="Qwen/Qwen2.5-32B-Instruct-AWQ",
         port=8011,
-        gpu=1,
+        gpu=2,
         max_model_len=8192,
     ),
     # Secondary, harmful arm only. Answers a DIFFERENT question: of the responses that
@@ -96,7 +96,7 @@ JUDGE_MODELS: dict[str, ModelSpec] = {
         quantization=None,  # bf16: the instrument is not quantized
         tokenizer_id="meta-llama/Llama-Guard-3-8B",
         port=8012,
-        gpu=1,
+        gpu=2,
         max_model_len=8192,
     ),
 }
@@ -413,10 +413,28 @@ def snapshot() -> dict:
     return out
 
 
+# Fields on a ModelSpec that describe where a server happens to be running, not what
+# the experiment is. Excluded from config_hash so that moving a model to a different
+# card or port does not invalidate a gate run -- optimizer.py refuses to start when the
+# gates were recorded under a different hash, and it should refuse for protocol changes,
+# not for `CUDA_VISIBLE_DEVICES`. They stay in snapshot(), so the record still says where
+# the run happened.
+OPERATIONAL_FIELDS = ("port", "gpu")
+
+
 def config_hash() -> str:
     """Short digest of the pre-registration. Written onto every rollout record so a
     result can never be silently attributed to a different protocol."""
-    blob = json.dumps(snapshot(), sort_keys=True, default=str).encode()
+    scientific = {}
+    for name, value in snapshot().items():
+        if isinstance(value, dict) and all(isinstance(v, dict) for v in value.values()):
+            scientific[name] = {
+                key: {k: v for k, v in spec.items() if k not in OPERATIONAL_FIELDS}
+                for key, spec in value.items()
+            }
+        else:
+            scientific[name] = value
+    blob = json.dumps(scientific, sort_keys=True, default=str).encode()
     return hashlib.sha256(blob).hexdigest()[:12]
 
 
