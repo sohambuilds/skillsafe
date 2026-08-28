@@ -41,8 +41,20 @@ from src.judge import (
 UNCONSTRAINED_OUTPUT = "CLASS: 2_full_refusal\n\nThe response directly states"
 
 
-def _stub(mode: str, seen: list, calls: list):
-    """mode='honours' obeys extra_body; mode='ignores' free-runs like vLLM >=0.12."""
+def _stub(mode: str, seen: list, calls: list, served=("rubric",), up=True):
+    """mode='honours' obeys extra_body; mode='ignores' free-runs like vLLM >=0.12.
+
+    `served` is what /v1/models reports and `up` whether the port answers at all --
+    the two ways a judge can be pointed at the wrong server.
+    """
+
+    class Models:
+        async def list(self):
+            if not up:
+                raise openai.APIConnectionError(request=None)
+            return types.SimpleNamespace(
+                data=[types.SimpleNamespace(id=name) for name in served]
+            )
 
     class Completions:
         async def create(self, **kw):
@@ -59,6 +71,7 @@ def _stub(mode: str, seen: list, calls: list):
         def __init__(self, **kw):
             self.base_url = "http://localhost:8011/v1/"
             self.chat = types.SimpleNamespace(completions=Completions())
+            self.models = Models()
 
     return Client
 
@@ -68,9 +81,9 @@ def stub(monkeypatch):
     async def _ok(value):
         return value
 
-    def build(mode):
+    def build(mode, served=("rubric",), up=True):
         seen, calls = [], []
-        monkeypatch.setattr(openai, "AsyncOpenAI", _stub(mode, seen, calls))
+        monkeypatch.setattr(openai, "AsyncOpenAI", _stub(mode, seen, calls, served, up))
         # _server_version is a diagnostic-only lookup against a server that does not
         # exist here; short-circuit it so the test does not wait on a real socket.
         monkeypatch.setattr(RubricJudge, "_server_version", lambda self: _ok("stub"))
@@ -124,3 +137,32 @@ def test_probe_choices_are_not_the_real_labels():
     """Probing with the real label set would pass whenever the model guessed the format
     on its own -- which Qwen frequently does. The sentinels have to be unguessable."""
     assert not set(_PROBE_CHOICES) & set(RUBRIC_CHOICES)
+
+
+def test_dead_port_names_the_server_and_the_start_command(stub):
+    """The OpenAI client reports a dead port as a bare "Connection error." naming
+    neither host nor port. With three judges rotating across three ports, that is not
+    enough to act on."""
+    judge, _, _ = stub("honours", up=False)
+    with pytest.raises(judge_mod.JudgeUnreachable) as excinfo:
+        asyncio.run(judge.preflight())
+    message = str(excinfo.value)
+    assert "8011" in message and "rubric" in message
+    assert "vllm serve" in message          # the command to fix it, not just the symptom
+
+
+def test_wrong_model_on_the_port_is_caught(stub):
+    """The silent one: a live server answering for a different model. Only caught by
+    checking WHICH model is served, not whether something replied."""
+    judge, _, _ = stub("honours", served=("wildguard",))
+    with pytest.raises(judge_mod.JudgeUnreachable) as excinfo:
+        asyncio.run(judge.preflight())
+    assert "wildguard" in str(excinfo.value)
+
+
+def test_unreachable_is_not_swallowable(stub):
+    """Same reasoning as ConstraintNotApplied: absent instrument, not a bad parse."""
+    judge, _, _ = stub("honours", up=False)
+    with pytest.raises(judge_mod.JudgeUnreachable) as excinfo:
+        asyncio.run(judge.classify("q", "a"))
+    assert not isinstance(excinfo.value, JudgeParseError)

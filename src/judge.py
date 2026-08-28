@@ -105,6 +105,21 @@ class ConstraintNotApplied(RuntimeError):
     """
 
 
+class JudgeUnreachable(RuntimeError):
+    """No usable server on this judge's port.
+
+    Like ConstraintNotApplied and unlike JudgeParseError, this is never swallowed:
+    it means the instrument is absent, not that one response failed to parse.
+
+    Covers two distinct faults that the OpenAI client reports very differently. A dead
+    port surfaces as a bare "APIConnectionError: Connection error." naming neither the
+    host nor the port -- unhelpful when three judges rotate across three ports on one
+    card. A LIVE port serving the wrong model is worse: if two servers were ever
+    started with the same --served-model-name, requests would be answered confidently
+    by the wrong model and nothing downstream would notice.
+    """
+
+
 def _parse_wildguard(text: str) -> dict:
     fields = {"harmful_request": None, "refusal": None, "harmful_response": None}
     for line in text.splitlines():
@@ -200,6 +215,18 @@ def _choice_body(choices: list[str]) -> dict:
     return {"structured_outputs": {"choice": list(choices)}}
 
 
+def serve_hint(spec) -> str:
+    """The exact command that starts this judge. Imported late: src.serve pulls in
+    huggingface_hub for its provenance helper, which is not worth paying for on every
+    judge import, and this is only ever needed on an error path."""
+    try:
+        from src.serve import serve_command
+
+        return serve_command(spec)
+    except Exception:  # a broken hint must never replace the real error
+        return f"(see src/serve.py --print {spec.key})"
+
+
 # Strings the model cannot emit unprompted, against a prompt that invites free prose.
 # Getting one back is evidence the SERVER constrained the decode -- not evidence the
 # model happened to answer in the right format, which is what probing with the real
@@ -220,11 +247,47 @@ class _Judge:
         from openai import AsyncOpenAI
 
         self.spec = config.JUDGE_MODELS[self.key]
-        self.client = AsyncOpenAI(
-            base_url=base_url or f"http://localhost:{self.spec.port}/v1",
-            api_key="EMPTY",
-            timeout=600,
-        )
+        self.base_url = base_url or f"http://localhost:{self.spec.port}/v1"
+        self.client = AsyncOpenAI(base_url=self.base_url, api_key="EMPTY", timeout=600)
+        self._preflight_result: dict | None = None
+        # asyncio.Lock has not bound a loop at construction since 3.10, so building it
+        # here is safe. Double-checked below so judge_file()'s fan-out asks once.
+        self._preflight_lock = asyncio.Lock()
+
+    async def preflight(self) -> dict:
+        """Confirm a server is up on this port AND that it is serving THIS model.
+
+        Two different facts. Section 2 says to assume the pipeline is broken until a
+        control proves otherwise, and "something answered" is not that proof.
+        """
+        if self._preflight_result is not None:
+            return self._preflight_result
+        async with self._preflight_lock:
+            if self._preflight_result is not None:
+                return self._preflight_result
+            try:
+                served = [m.id for m in (await self.client.models.list()).data]
+            except Exception as error:
+                raise JudgeUnreachable(
+                    f"no server answering at {self.base_url} for judge "
+                    f"{self.key!r} ({self.spec.hf_id}).\n"
+                    f"  {type(error).__name__}: {error}\n\n"
+                    f"Start it with:\n\n{serve_hint(self.spec)}\n\n"
+                    "and wait for 'Application startup complete' -- a large AWQ "
+                    "checkpoint takes minutes to load, and the port refuses "
+                    "connections until it does."
+                ) from error
+            if self.spec.key not in served:
+                raise JudgeUnreachable(
+                    f"{self.base_url} is serving {served}, which does not include "
+                    f"{self.spec.key!r}. Something is on this port, but it is not the "
+                    f"{self.key} judge -- most likely another judge from the GPU 2 "
+                    f"rotation, or a serve command whose --served-model-name does not "
+                    f"match config.JUDGE_MODELS.\n\n"
+                    f"Expected command:\n\n{serve_hint(self.spec)}"
+                )
+            self._preflight_result = {"base_url": self.base_url, "served": served}
+            return self._preflight_result
 
     async def classify(self, prompt: str, response: str) -> dict:
         raise NotImplementedError
@@ -288,6 +351,7 @@ class RubricJudge(_Judge):
         """
         if self._probe_result is not None:
             return self._probe_result
+        await self.preflight()
         async with self._probe_lock:
             if self._probe_result is not None:
                 return self._probe_result
@@ -450,6 +514,7 @@ SMOKE_CASES = [
 
 async def smoke_test(judge_key: str) -> dict:
     judge = JUDGES[judge_key]()
+    await judge.preflight()
     # Before the known-answer cases, not after. An unconstrained rubric judge can still
     # pass the cases by luck -- Qwen does often emit the bare label unprompted -- and
     # that pass would certify a free-text generator as a validated instrument.
@@ -514,6 +579,10 @@ async def judge_file(path: Path, judge_keys: list[str], concurrency: int | None 
     arm = records[0].get("arm")
     keys = [k for k in judge_keys if not (k == "llamaguard" and arm != "harmful")]
     instances = {k: JUDGES[k]() for k in keys}
+    # All of them, up front. Judges are served one at a time on GPU 2, so "I forgot to
+    # start that one" is the expected failure -- and finding out after 90 records have
+    # been written is strictly worse than finding out now.
+    await asyncio.gather(*(j.preflight() for j in instances.values()))
     semaphore = asyncio.Semaphore(concurrency or config.CLIENT_CONCURRENCY)
 
     async def one(record: dict) -> None:
