@@ -42,7 +42,13 @@ def serve_command(spec: ModelSpec, gpu: int | None = None) -> str:
     gpu = spec.gpu if gpu is None else gpu
     parts = [
         f"CUDA_VISIBLE_DEVICES={gpu}",
-        "vllm serve",
+        # `uv run` is load-bearing, not decoration. A bare `vllm serve` resolves against
+        # PATH, which on a machine with a system anaconda picks that interpreter's vLLM
+        # instead of the project venv's -- and a vLLM compiled against a different
+        # libtorch than the torch beside it fails with an undefined-symbol ImportError
+        # that names a C++ mangled symbol and nothing else. Every other command in this
+        # project goes through uv; this one has to as well.
+        "uv run vllm serve",
         spec.hf_id,
         f"--served-model-name {spec.key}",
         f"--port {spec.port}",
@@ -99,6 +105,68 @@ def quantization_provenance() -> dict:
         "and re-quantize with a common toolchain only if the families disagree."
     )
     return out
+
+
+def doctor() -> dict:
+    """Which vLLM and torch are actually being used, and do they match.
+
+    Exists because the failure it diagnoses surfaces as
+    `ImportError: vllm/_C.abi3.so: undefined symbol: _ZNR5torch7Library4_def...`,
+    which names a mangled C++ symbol and nothing an operator can act on. The cause is
+    almost always that vLLM's compiled extension was built against a different libtorch
+    than the torch sitting beside it -- typically because a bare `vllm` resolved to a
+    system anaconda rather than the project venv.
+    """
+    import sys
+
+    report: dict = {
+        "python": sys.executable,
+        "prefix": sys.prefix,
+        "in_project_venv": str(Path(sys.prefix).resolve())
+                           == str((Path(__file__).resolve().parent.parent / ".venv")),
+    }
+    try:
+        import torch
+
+        report["torch"] = {
+            "version": torch.__version__,
+            "file": torch.__file__,
+            "cuda_build": torch.version.cuda,
+            "cuda_available": torch.cuda.is_available(),
+            "devices": [
+                {"index": i,
+                 "name": torch.cuda.get_device_name(i),
+                 "total_gb": round(torch.cuda.get_device_properties(i).total_memory / 2**30, 1)}
+                for i in range(torch.cuda.device_count())
+            ] if torch.cuda.is_available() else [],
+        }
+    except Exception as error:  # noqa: BLE001
+        report["torch"] = {"error": f"{type(error).__name__}: {error}"}
+
+    try:
+        import vllm
+
+        report["vllm"] = {"version": vllm.__version__, "file": vllm.__file__}
+    except ImportError as error:
+        report["vllm"] = {
+            "error": f"{type(error).__name__}: {error}",
+            "diagnosis": (
+                "undefined symbol -> vLLM's compiled extension does not match the "
+                "installed torch. Do not patch the system environment; install into the "
+                "project venv where vLLM pins its own torch:\n"
+                "    uv sync --extra gpu\n"
+                "and launch every server through `uv run vllm serve ...`."
+                if "undefined symbol" in str(error) else
+                "vLLM is not importable here. Run `uv sync --extra gpu`."
+            ),
+        }
+    except Exception as error:  # noqa: BLE001
+        report["vllm"] = {"error": f"{type(error).__name__}: {error}"}
+
+    report["_ok"] = ("error" not in report.get("vllm", {})
+                     and "error" not in report.get("torch", {})
+                     and report["torch"].get("cuda_available") is True)
+    return report
 
 
 def access_check() -> dict:
@@ -161,7 +229,14 @@ def main() -> None:
                              "and write logs/quantization_provenance.json")
     parser.add_argument("--check-access", action="store_true",
                         help="ask the Hub whether the current token can reach every repo")
+    parser.add_argument("--doctor", action="store_true",
+                        help="report which vllm/torch are resolved and whether they match")
     args = parser.parse_args()
+
+    if args.doctor:
+        report = doctor()
+        print(json.dumps(report, indent=2))
+        raise SystemExit(0 if report["_ok"] else 1)
 
     if args.check_access:
         report = access_check()
