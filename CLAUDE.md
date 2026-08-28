@@ -519,10 +519,26 @@ correctly REFUSAL, and it is indistinguishable in the label from a safety over-r
 selective guardrail erosion" row assumes the benign arm measures over-refusal in the
 safety sense. If the safe arm's REFUSAL mass is mostly scope deflection, "benign flat"
 may only mean the model's sense of its own job did not change — which says nothing about
-guardrails, and makes the finding row and the null row indistinguishable. Do not read a
-Day 2 result through that table until the decomposition in `RUNBOOK.md` §3.2 is done.
-`src/judge.py` already records an `attempt` head on every rollout for exactly this; it
-has not been analysed.
+guardrails, and makes the finding row and the null row indistinguishable.
+
+**Status: open, and the cheap test failed to close it.** `src/deflection.py --decompose`
+attributes the shift to the route that carried it. The route that is scope by
+construction — a `1_full_compliance` that the `attempt` head promotes to REFUSAL —
+carries **+0.0 pp of llama's 18.0 and +6.8 of Qwen's 68.4**. The rest arrived as
+`2_full_refusal`, where the rubric cannot separate an explicit scope refusal from a
+safety refusal. Scope deflection is neither confirmed nor ruled out; 52.0 of Qwen's
+points and 16.8 of llama's are unresolved. **Do not read a Day 2 result through §3's
+table until the hand read in `RUNBOOK.md` §3.2 is done.**
+
+A prediction of ~70% was placed on scope deflection being the dominant driver before this
+was measured. It was wrong by roughly an order of magnitude on the measurable route.
+Discount mechanism guesses in this project accordingly.
+
+**Watch the composition, not just the rate.** On qwen/harmful the collapsed refusal rate
+is flat (−0.4 pp) while partial refusals fall 119 → 78 and outright refusals rise
+122 → 160. The inert skill makes Qwen's refusals substantially more decisive without
+moving the headline number. Any Day 2 analysis that reads only the collapsed rate will
+report "nothing happened" for a cell where a great deal happened.
 
 ### 11.3 Qwen's partial rate makes the collapse choice load-bearing
 

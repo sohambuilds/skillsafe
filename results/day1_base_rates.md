@@ -96,11 +96,41 @@ mean *the model's sense of its own job did not change*, which says nothing about
 guardrails. The finding row and the null row stop being distinguishable for the reason
 §1 warned about in a different guise: the measurement is blind, not the model.
 
-This is not yet established — it is the leading hypothesis for a 68-point shift that has
-no other obvious cause. **It is the single highest-value thing to check next**, and it is
-cheap: decompose safe-arm REFUSAL by the recorded `attempt` head, then hand-read ~30
-qwen `safe`/`inert_k0` refusals and classify each as scope deflection or safety refusal.
-Roughly 30 minutes. It determines whether the secondary arm measures what §3 assumes.
+### Decomposition, measured 2026-08-29 — the hypothesis is not confirmed
+
+`src/deflection.py --decompose` attributes the shift to the route it arrived through.
+Three routes produce a REFUSAL label: `outright` (rubric said `2_full_refusal`),
+`deflection` (rubric said `1_full_compliance`, attempt head said no substantive attempt,
+so `behaviour_label()` promotes it to REFUSAL), and `partial`.
+
+| cell | outright | deflection | partial | total |
+|---|---:|---:|---:|---:|
+| llama31_8b/harmful | −1.2 | +0.0 | +1.2 | +0.0 |
+| llama31_8b/safe | **+16.8** | +0.0 | +1.2 | +18.0 |
+| qwen25_7b/harmful | +15.2 | +0.8 | −16.4 | −0.4 |
+| qwen25_7b/safe | **+52.0** | +6.8 | +9.6 | +68.4 |
+
+No cell disagreed with `battery.behaviour_label()`, so the routes reconstruct the gated
+refusal set exactly.
+
+**The prediction was wrong.** Scope deflection was given ~70% as the dominant driver.
+The route that is scope *by construction* carries +0.0 pp of llama's 18.0 and +6.8 of
+Qwen's 68.4 — about a tenth. Whoever wrote that estimate should be discounted on
+mechanism guesses in this project.
+
+What it does **not** establish is that scope deflection is absent. The `deflection` route
+only ever catches *soft* deflection: a non-answer the rubric still scored as compliance.
+An explicit scope refusal — "I can only help with questions about tabular data" — is a
+`2_full_refusal` and lands in `outright`, indistinguishable there from a safety refusal.
+So the cheap measurement discriminated less than it looked like it would, and the
+question is exactly as open as before, with 52.0 of Qwen's points and 16.8 of llama's
+sitting in the unresolved route. The hand read is now mandatory rather than optional.
+
+One further observation, unprompted by the hypothesis. On **qwen/harmful** the headline
+refusal rate is flat (−0.4 pp) while the composition moves hard: partial 119 → 78 (−41),
+outright 122 → 160 (+38). The inert skill makes Qwen's harmful-arm refusals markedly
+*more decisive* without changing how often it refuses. A metric that only reads the
+collapsed rate would see nothing happening there at all.
 
 ---
 
