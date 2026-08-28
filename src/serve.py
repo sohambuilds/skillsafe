@@ -101,12 +101,53 @@ def quantization_provenance() -> dict:
     return out
 
 
-def preflight_notes() -> list[str]:
-    notes = []
-    for spec in ALL_MODELS.values():
-        if spec.hf_id in GATED:
-            notes.append(f"  {spec.hf_id}  --  gated: {GATED[spec.hf_id]}")
-    return notes
+def access_check() -> dict:
+    """Ask the Hub whether THIS token can actually reach each repo.
+
+    The previous version of this printed a static reminder for every repo in GATED,
+    unconditionally, without consulting the Hub or the token. It printed the same text
+    whether access was granted or refused -- a check that could not fail, which is the
+    failure mode this project keeps finding in its own instruments. It is harmless to the
+    results and it still had to go.
+
+    A gated repo without access raises GatedRepoError (403) or, when the repo is hidden
+    from the caller, RepositoryNotFoundError (404). Both are treated as BLOCKED.
+    """
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+
+    api = HfApi()
+    out: dict = {}
+    try:
+        out["_token"] = {"status": "OK", "user": api.whoami().get("name")}
+    except Exception as error:  # noqa: BLE001
+        out["_token"] = {"status": "NO_TOKEN", "error": f"{type(error).__name__}: {error}",
+                         "fix": "hf auth login"}
+
+    for key, spec in ALL_MODELS.items():
+        entry: dict = {"repo": spec.hf_id, "gated_because": GATED.get(spec.hf_id)}
+        try:
+            info = api.model_info(spec.hf_id)
+            entry["status"] = "OK"
+            entry["gated"] = getattr(info, "gated", None)
+            entry["revision"] = getattr(info, "sha", None)
+        except GatedRepoError:
+            entry["status"] = "BLOCKED"
+            entry["fix"] = f"accept the licence at https://huggingface.co/{spec.hf_id}"
+        except RepositoryNotFoundError:
+            entry["status"] = "BLOCKED"
+            entry["fix"] = (f"https://huggingface.co/{spec.hf_id} is not visible to this "
+                            "token -- accept the licence, or check the repo id")
+        except Exception as error:  # noqa: BLE001
+            entry["status"] = "ERROR"
+            entry["error"] = f"{type(error).__name__}: {error}"
+        out[key] = entry
+
+    blocked = [k for k, v in out.items()
+               if k != "_token" and v.get("status") != "OK"]
+    out["_blocked"] = blocked
+    out["_all_reachable"] = not blocked and out["_token"]["status"] == "OK"
+    return out
 
 
 def main() -> None:
@@ -118,7 +159,14 @@ def main() -> None:
     parser.add_argument("--provenance", action="store_true",
                         help="read every checkpoint's quantization_config off the Hub "
                              "and write logs/quantization_provenance.json")
+    parser.add_argument("--check-access", action="store_true",
+                        help="ask the Hub whether the current token can reach every repo")
     args = parser.parse_args()
+
+    if args.check_access:
+        report = access_check()
+        print(json.dumps(report, indent=2))
+        raise SystemExit(0 if report["_all_reachable"] else 1)
 
     if args.provenance:
         report = quantization_provenance()
@@ -155,11 +203,19 @@ def main() -> None:
     else:
         print(text)
 
-    notes = preflight_notes()
-    if notes:
-        print("\n# Gated repos -- accept the licence on huggingface.co and run "
-              "`hf auth login` before the first download:")
-        print("\n".join(notes))
+    print("\n# Repo access (live check against the Hub with your current token):")
+    report = access_check()
+    print(f"  token: {report['_token']['status']}"
+          + (f"  ({report['_token'].get('user')})" if report["_token"].get("user") else ""))
+    for key, entry in report.items():
+        if key.startswith("_"):
+            continue
+        line = f"  {entry['status']:<8} {entry['repo']}"
+        if entry.get("fix"):
+            line += f"\n           -> {entry['fix']}"
+        print(line)
+    if report["_all_reachable"]:
+        print("  all reachable -- nothing to do")
 
 
 if __name__ == "__main__":
