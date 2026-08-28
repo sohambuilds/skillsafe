@@ -198,9 +198,21 @@ def build_inert(target_tokens: int, tokenizer=None, seed: int = 0,
                 tolerance: float = 0.05) -> str:
     """Assemble descriptive prose landing within `tolerance` of `target_tokens`.
 
+    Three phases, coarse to fine. The earlier single-pass version stalled below the
+    window: it filled with whole paragraphs, then greedily appended sentences from the
+    one paragraph that overshot, and broke unconditionally. Sentences run 30-40 tokens
+    while the +/-5% window at target 250 is 25 tokens wide, so "the next sentence
+    overshoots" and "we are inside the window" are independent conditions -- at target
+    250 it landed on 227 and returned it. CLAUDE.md section 3 makes +/-5% a hard
+    requirement, so the fill has to be able to reach it from any starting point.
+
+      1. whole paragraphs, headings every third, while they fit under `upper`
+      2. best-fit sentence packing, drawing from every paragraph rather than one
+      3. word-level trim of a single sentence, as a last resort
+
     Deterministic given (target_tokens, tokenizer, seed): paragraph order comes from a
-    seeded shuffle, and the trim is greedy from the front. Regenerating an inert control
-    for the same target always reproduces the same file.
+    seeded shuffle and every tie is broken by corpus order, so regenerating a control for
+    the same target always reproduces the same file byte for byte.
     """
     rng = random.Random(seed)
     order = list(range(len(PARAGRAPHS)))
@@ -209,44 +221,60 @@ def build_inert(target_tokens: int, tokenizer=None, seed: int = 0,
     lower = target_tokens * (1 - tolerance)
     upper = target_tokens * (1 + tolerance)
 
-    blocks: list[str] = [HEADING]
-    heading_at = 0
-    used_paragraphs = 0
-    cycles = 0
-
     def render(parts: list[str]) -> str:
         return "\n\n".join(parts) + "\n"
 
-    while count_tokens(render(blocks), tokenizer) < lower:
-        if used_paragraphs % 3 == 0 and heading_at < len(SECTION_HEADINGS):
-            blocks.append(SECTION_HEADINGS[heading_at])
-            heading_at += 1
-            if count_tokens(render(blocks), tokenizer) >= lower:
-                break
+    def size(parts: list[str]) -> int:
+        return count_tokens(render(parts), tokenizer)
 
-        index = order[used_paragraphs % len(order)]
-        paragraph = PARAGRAPHS[index]
-        used_paragraphs += 1
-        if used_paragraphs % len(order) == 0:
-            cycles += 1
-            if cycles > 4:  # corpus exhausted; refuse to loop forever
-                break
-
-        trial = blocks + [paragraph]
-        if count_tokens(render(trial), tokenizer) <= upper:
+    # --- phase 1: whole paragraphs ------------------------------------------
+    blocks: list[str] = [HEADING]
+    heading_at = 0
+    for step, index in enumerate(order * 6):  # cycles only for very long targets
+        if size(blocks) >= lower:
+            break
+        if step % 3 == 0 and heading_at < len(SECTION_HEADINGS):
+            trial = blocks + [SECTION_HEADINGS[heading_at]]
+            if size(trial) <= upper:
+                blocks = trial
+                heading_at += 1
+                if size(blocks) >= lower:
+                    break
+        trial = blocks + [PARAGRAPHS[index]]
+        if size(trial) <= upper:
             blocks = trial
-            continue
 
-        # Adding the whole paragraph overshoots. Add sentences until the next one would.
-        partial: list[str] = []
-        for sentence in _sentences(paragraph):
-            candidate = partial + [sentence]
-            if count_tokens(render(blocks + [" ".join(candidate)]), tokenizer) > upper:
+    # --- phase 2: best-fit sentence packing ---------------------------------
+    # Finer granularity than a paragraph, and drawn from the whole corpus rather than
+    # from whichever paragraph happened to overshoot, so a short sentence is available
+    # to close a small gap.
+    if size(blocks) < lower:
+        pool = [s for index in order for s in _sentences(PARAGRAPHS[index])]
+        tail: list[str] = []
+        while size(blocks + ([" ".join(tail)] if tail else [])) < lower:
+            best: tuple[int, str] | None = None
+            for sentence in pool:
+                total = size(blocks + [" ".join(tail + [sentence])])
+                if total <= upper and (best is None or total > best[0]):
+                    best = (total, sentence)
+            if best is None:
                 break
-            partial = candidate
-        if partial:
-            blocks.append(" ".join(partial))
-        break
+            tail.append(best[1])
+            pool.remove(best[1])
+        if tail:
+            blocks.append(" ".join(tail))
+
+    # --- phase 3: word-level trim, last resort ------------------------------
+    # Leaves a sentence fragment, which is cosmetically poor but behaviourally identical:
+    # the control is descriptive prose either way, and validate_inert() still governs.
+    # Preferred over returning a length the brief forbids.
+    if size(blocks) < lower:
+        for sentence in (s for index in order for s in _sentences(PARAGRAPHS[index])):
+            words = sentence.split()
+            for cut in range(len(words), 0, -1):
+                trial = blocks + [" ".join(words[:cut])]
+                if lower <= size(trial) <= upper:
+                    return render(trial)
 
     return render(blocks)
 
@@ -275,6 +303,10 @@ def match_skill(skill_path: Path, out_path: Path, tokenizer_id: str | None,
         "inert_tokens": got,
         "pct_difference": round(100 * (got - target) / max(target, 1), 2),
         "within_5pct": abs(got - target) <= 0.05 * target,
+        # True when phase 3 of build_inert had to word-trim to reach the window. Not a
+        # problem -- the control is still descriptive prose and still passes
+        # validate_inert -- but it is recorded rather than left invisible.
+        "ends_mid_sentence": not text.rstrip().endswith("."),
         "seed": seed,
     }
 

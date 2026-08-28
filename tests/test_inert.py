@@ -18,14 +18,22 @@ def test_corpus_is_behaviourally_empty():
         assert validate_inert(paragraph) == [], f"paragraph {i}: {validate_inert(paragraph)}"
 
 
-@pytest.mark.parametrize("target", [180, 250, 400, 700, 1100])
+# Swept, not spot-checked. The original five-point version passed at 180 and 400 and
+# missed at 250: paragraph-then-sentence filling stalls wherever the gap to the window
+# is smaller than the next available sentence, which depends on the target in a way no
+# handful of samples covers. The real run calls build_inert at whatever token count the
+# optimizer's skill happens to be, so the sweep is the honest test.
+SWEEP = list(range(160, 1301, 20))
+
+
+@pytest.mark.parametrize("target", SWEEP)
 def test_build_inert_hits_target_within_5pct(target):
     text = build_inert(target)
     got = count_tokens(text)
     assert abs(got - target) <= 0.05 * target, f"target={target} got={got}"
 
 
-@pytest.mark.parametrize("target", [180, 400, 1100])
+@pytest.mark.parametrize("target", [180, 250, 400, 700, 1100])
 def test_generated_control_is_behaviourally_empty(target):
     assert validate_inert(build_inert(target)) == []
 
