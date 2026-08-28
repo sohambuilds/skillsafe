@@ -46,14 +46,32 @@ def sha256_file(path: Path) -> str:
 
 
 def write_jsonl(path: Path, rows: list[dict], force: bool) -> None:
-    if path.exists() and not force:
-        raise SystemExit(
-            f"{path} already exists. CLAUDE.md section 3 says never resample. "
-            f"Pass --force only if you are deliberately re-freezing, and record why."
-        )
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    """Idempotent freeze. CLAUDE.md section 3: "Never resample."
+
+    Regenerating byte-identical content is not resampling, so it is allowed silently --
+    every draw here is seeded, so a re-run of a step that already succeeded reproduces
+    exactly. Regenerating DIFFERENT content is resampling, and that stops the run.
+
+    This is a stronger guard than refusing on mere existence: bare existence blocks a
+    harmless retry after an unrelated step failed, while saying nothing about whether the
+    upstream source shifted underneath a file that already exists.
+    """
+    payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+        if existing == payload:
+            print(f"unchanged {len(rows):>5} rows == {path}")
+            return
+        if not force:
+            raise SystemExit(
+                f"{path} exists and the regenerated content DIFFERS from it "
+                f"({len(existing.splitlines())} rows on disk vs {len(rows)} now). The "
+                "upstream source has changed under a frozen file. Section 3 says never "
+                "resample: investigate the difference, then pass --force only if you "
+                "intend to re-freeze, and record why in FINDINGS.md."
+            )
+        print(f"OVERWRITING {path} (--force)")
+    path.write_text(payload, encoding="utf-8")
     print(f"wrote {len(rows):>5} rows -> {path}")
 
 
@@ -72,7 +90,11 @@ def _load_wtq():
     from datasets import load_dataset
 
     try:
-        return load_dataset(config.WTQ_HF_ID)
+        # trust_remote_code is explicit rather than left to the interactive [y/N] prompt.
+        # The prompt blocks a re-run under nohup or in CI, and answering it by hand makes
+        # the freeze depend on a keystroke that nothing records. The repo is Stanford's
+        # own and its loading script is what produced the 11321/2831/4344 splits.
+        return load_dataset(config.WTQ_HF_ID, trust_remote_code=True)
     except Exception as first_error:  # noqa: BLE001 - we re-raise with both causes
         print(f"  default load failed ({type(first_error).__name__}), trying parquet branch")
         try:
@@ -216,73 +238,115 @@ STRONGREJECT_CSV = (
     "https://raw.githubusercontent.com/alexandrasouly/strongreject/main/"
     "strongreject_dataset/strongreject_dataset.csv"
 )
-XSTEST_CSV = (
-    "https://raw.githubusercontent.com/paul-rottger/exaggerated-safety/main/"
-    "xstest_v2_prompts.csv"
-)
+
+# How many rows each source is expected to yield AFTER filtering. Checked, not assumed.
+# The failure this guards is quiet and severe: the safe arm is built by keeping rows with
+# label == "safe". If a mirror renames or inverts its label vocabulary, the filter can
+# silently pass every row through, and the "over-refusal arm" ends up ~44% genuinely
+# harmful prompts (XSTest is 250 safe + 200 unsafe). Nothing downstream would reveal it.
+EXPECTED_ROWS = {"strongreject": 313, "xstest_safe": 250, "orbench_hard": 1319}
 
 
-def _load_harmful(source: str) -> list[dict]:
-    from datasets import load_dataset
+def _try_sources(candidates: list[tuple[str, object]]) -> tuple[list[dict], str]:
+    """Try each source in order; return the first that yields rows, plus its name.
 
-    if source == "strongreject":
+    Reports every failure together at the end rather than chaining one exception inside
+    another's handler, which is what made the first XSTest failure unreadable.
+    """
+    errors = []
+    for name, loader in candidates:
         try:
-            data = load_dataset("walledai/StrongREJECT", split="train")
-            return [
-                {"prompt": str(r["prompt"]), "meta": {k: str(v) for k, v in r.items() if k != "prompt"}}
-                for r in data
-            ]
-        except Exception as error:  # noqa: BLE001
-            print(f"  HF load failed ({type(error).__name__}); falling back to the CSV")
-            import pandas as pd
+            rows = loader()
+        except Exception as error:  # noqa: BLE001 - collected and reported below
+            errors.append((name, f"{type(error).__name__}: {error}"))
+            continue
+        if rows:
+            print(f"  resolved via {name}  ({len(rows)} rows)")
+            return rows, name
+        errors.append((name, "returned 0 rows"))
+    raise SystemExit(
+        "every candidate source failed:\n"
+        + "\n".join(f"  {name}: {why}" for name, why in errors)
+    )
 
-            frame = pd.read_csv(STRONGREJECT_CSV)
-            column = "forbidden_prompt" if "forbidden_prompt" in frame else frame.columns[-1]
-            return [
-                {"prompt": str(row[column]),
-                 "meta": {k: str(row[k]) for k in frame.columns if k != column}}
-                for _, row in frame.iterrows()
-            ]
+
+def _hf(repo: str, *, config_name: str | None = None, split: str = "train"):
+    def load():
+        from datasets import load_dataset
+
+        data = (load_dataset(repo, config_name, split=split) if config_name
+                else load_dataset(repo, split=split))
+        return list(data)
+    return load
+
+
+def _csv(url: str):
+    def load():
+        import pandas as pd
+
+        return pd.read_csv(url).to_dict("records")
+    return load
+
+
+def _load_harmful(source: str) -> tuple[list[dict], str]:
+    if source == "strongreject":
+        rows, resolved = _try_sources([
+            # The CSV is the canonical release and is what actually resolved on first
+            # run; the HF mirrors are kept as fallbacks, not as the primary.
+            ("csv:alexandrasouly/strongreject", _csv(STRONGREJECT_CSV)),
+            ("hf:walledai/StrongREJECT", _hf("walledai/StrongREJECT")),
+            ("hf:csinva/strongreject", _hf("csinva/strongreject")),
+        ])
+        key = next((c for c in ("forbidden_prompt", "prompt") if c in rows[0]), None)
+        if key is None:
+            raise SystemExit(f"no prompt column in {resolved}; got {list(rows[0])}")
+        return ([{"prompt": str(r[key]),
+                  "meta": {k: str(v) for k, v in r.items() if k != key}}
+                 for r in rows], resolved)
 
     if source == "advbench":
-        data = load_dataset("walledai/AdvBench", split="train")
-        return [{"prompt": str(r["prompt"]), "meta": {}} for r in data]
+        rows, resolved = _try_sources([("hf:walledai/AdvBench", _hf("walledai/AdvBench"))])
+        return ([{"prompt": str(r["prompt"]), "meta": {}} for r in rows], resolved)
 
     raise SystemExit(f"unknown harmful source {source!r}")
 
 
-def _load_safe(source: str) -> list[dict]:
-    from datasets import load_dataset
-
+def _load_safe(source: str) -> tuple[list[dict], str]:
     if source == "xstest_safe":
-        try:
-            data = load_dataset("walledai/XSTest", split="train")
-            rows = [r for r in data if str(r.get("label", "")).lower() == "safe"]
-            if not rows:
-                raise ValueError("no rows with label=='safe'")
-            return [
-                {"prompt": str(r["prompt"]), "meta": {"type": str(r.get("type", ""))}}
-                for r in rows
-            ]
-        except Exception as error:  # noqa: BLE001
-            print(f"  HF load failed ({type(error).__name__}); falling back to the CSV")
-            import pandas as pd
-
-            frame = pd.read_csv(XSTEST_CSV)
-            frame = frame[~frame["type"].astype(str).str.startswith("contrast")]
-            return [
-                {"prompt": str(row["prompt"]), "meta": {"type": str(row["type"])}}
-                for _, row in frame.iterrows()
-            ]
+        rows, resolved = _try_sources([
+            # Paul/XSTest is the author's own repo: 450 rows, columns id/prompt/type/
+            # label/focus/note, 250 of them label=="safe".
+            ("hf:Paul/XSTest", _hf("Paul/XSTest")),
+            ("hf:natolambert/xstest-v2-copy", _hf("natolambert/xstest-v2-copy")),
+            ("hf:walledai/XSTest", _hf("walledai/XSTest")),
+        ])
+        if "label" not in rows[0]:
+            raise SystemExit(
+                f"{resolved} has no 'label' column ({list(rows[0])}), so safe rows "
+                "cannot be separated from the 200 unsafe contrast prompts. Refusing to "
+                "build the over-refusal arm out of a mixture."
+            )
+        safe = [r for r in rows if str(r.get("label", "")).lower() == "safe"]
+        if len(safe) == len(rows):
+            raise SystemExit(
+                f"{resolved}: the label filter kept all {len(rows)} rows. XSTest is "
+                "250 safe + 200 unsafe, so a filter that removes nothing means the "
+                "label vocabulary changed and the over-refusal arm would be built out "
+                "of a mixture that includes genuinely harmful prompts."
+            )
+        return ([{"prompt": str(r["prompt"]), "meta": {"type": str(r.get("type", ""))}}
+                 for r in safe], resolved)
 
     if source == "orbench_hard":
         # The swap target from section 3, for when XSTest's baseline over-refusal is
         # too low for the arm to resolve anything.
-        data = load_dataset("bench-llms/or-bench", "or-bench-hard-1k", split="train")
-        return [
-            {"prompt": str(r["prompt"]), "meta": {"category": str(r.get("category", ""))}}
-            for r in data
-        ]
+        rows, resolved = _try_sources([
+            ("hf:bench-llms/or-bench:or-bench-hard-1k",
+             _hf("bench-llms/or-bench", config_name="or-bench-hard-1k")),
+        ])
+        return ([{"prompt": str(r["prompt"]),
+                  "meta": {"category": str(r.get("category", ""))}}
+                 for r in rows], resolved)
 
     raise SystemExit(f"unknown safe source {source!r}")
 
@@ -294,7 +358,20 @@ def prepare_battery(force: bool, harmful_source: str, safe_source: str) -> list[
         ("safe", safe_source, config.BATTERY_N_SAFE, BATTERY_SAFE, "safe", _load_safe),
     ):
         print(f"battery arm: {arm} ({source})")
-        pool = loader(source)
+        pool, resolved = loader(source)
+
+        expected = EXPECTED_ROWS.get(source)
+        if expected is not None and len(pool) != expected:
+            print(f"  WARNING {source} yielded {len(pool)} rows, expected {expected}. "
+                  "Check the source before trusting this arm.")
+        if expected is not None and abs(len(pool) - expected) > 0.25 * expected:
+            raise SystemExit(
+                f"{source} via {resolved} yielded {len(pool)} rows against an expected "
+                f"{expected}. That is too far off to be a version bump -- the source or "
+                "its filtering has changed. Refusing to freeze a battery arm whose "
+                "contents are not what the protocol says they are."
+            )
+
         # Deduplicate on exact prompt text before sampling. Two identical prompts are
         # one item of information, and a paired test treats them as two.
         seen, unique = set(), []
@@ -331,6 +408,9 @@ def prepare_battery(force: bool, harmful_source: str, safe_source: str) -> list[
                 "file": out_path.name,
                 "arm": arm,
                 "source": source,
+                # Which candidate actually served the data, not just which was asked for.
+                "resolved_source": resolved,
+                "expected_pool_rows": EXPECTED_ROWS.get(source),
                 "n": len(rows),
                 "seed": config.BATTERY_SAMPLE_SEED,
                 "pool_size": len(pool),
