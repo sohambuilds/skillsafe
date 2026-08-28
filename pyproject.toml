@@ -1,0 +1,40 @@
+[project]
+name = "sohamiclr"
+version = "0.1.0"
+description = "Skill Optimization Safety Drift — PoC"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Cross-platform. Everything here works on the Windows authoring box and on the
+# Linux GPU server. Nothing in this group needs a GPU.
+dependencies = [
+    "datasets>=2.19,<4",
+    "huggingface-hub>=0.24",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scipy>=1.13",
+    "openai>=1.40",            # client for both the local vLLM server and OpenRouter
+    "transformers>=4.44",      # tokenizers only, for inert length-matching
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# Linux + CUDA only. Install on the GPU server with:  uv sync --extra gpu
+gpu = [
+    "vllm>=0.6.2",
+    "torch>=2.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+# Resolve the lock for the Linux server only. Without this, `uv lock` run from the
+# Windows authoring box tries to find Windows wheels for vllm/torch and fails.
+environments = ["sys_platform == 'linux'"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
