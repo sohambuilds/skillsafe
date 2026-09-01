@@ -48,6 +48,7 @@ from pathlib import Path
 
 from src import config
 from src.io_utils import read_jsonl, write_json
+from src.preflight import ServerUnavailable, check_server, server_version
 from src.paths import JUDGE_VALIDATION, LOGS, RUNS
 
 # ---------------------------------------------------------------------------
@@ -105,19 +106,11 @@ class ConstraintNotApplied(RuntimeError):
     """
 
 
-class JudgeUnreachable(RuntimeError):
-    """No usable server on this judge's port.
-
-    Like ConstraintNotApplied and unlike JudgeParseError, this is never swallowed:
-    it means the instrument is absent, not that one response failed to parse.
-
-    Covers two distinct faults that the OpenAI client reports very differently. A dead
-    port surfaces as a bare "APIConnectionError: Connection error." naming neither the
-    host nor the port -- unhelpful when three judges rotate across three ports on one
-    card. A LIVE port serving the wrong model is worse: if two servers were ever
-    started with the same --served-model-name, requests would be answered confidently
-    by the wrong model and nothing downstream would notice.
-    """
+# The judge-side name for src.preflight.ServerUnavailable. Deliberately NOT a
+# JudgeParseError: that one means "one response did not parse", which judge_file()
+# is allowed to swallow for a secondary judge. This means the instrument is absent,
+# and nothing may downgrade it to a per-record note.
+JudgeUnreachable = ServerUnavailable
 
 
 def _parse_wildguard(text: str) -> dict:
@@ -215,18 +208,6 @@ def _choice_body(choices: list[str]) -> dict:
     return {"structured_outputs": {"choice": list(choices)}}
 
 
-def serve_hint(spec) -> str:
-    """The exact command that starts this judge. Imported late: src.serve pulls in
-    huggingface_hub for its provenance helper, which is not worth paying for on every
-    judge import, and this is only ever needed on an error path."""
-    try:
-        from src.serve import serve_command
-
-        return serve_command(spec)
-    except Exception:  # a broken hint must never replace the real error
-        return f"(see src/serve.py --print {spec.key})"
-
-
 # Strings the model cannot emit unprompted, against a prompt that invites free prose.
 # Getting one back is evidence the SERVER constrained the decode -- not evidence the
 # model happened to answer in the right format, which is what probing with the real
@@ -265,28 +246,8 @@ class _Judge:
         async with self._preflight_lock:
             if self._preflight_result is not None:
                 return self._preflight_result
-            try:
-                served = [m.id for m in (await self.client.models.list()).data]
-            except Exception as error:
-                raise JudgeUnreachable(
-                    f"no server answering at {self.base_url} for judge "
-                    f"{self.key!r} ({self.spec.hf_id}).\n"
-                    f"  {type(error).__name__}: {error}\n\n"
-                    f"Start it with:\n\n{serve_hint(self.spec)}\n\n"
-                    "and wait for 'Application startup complete' -- a large AWQ "
-                    "checkpoint takes minutes to load, and the port refuses "
-                    "connections until it does."
-                ) from error
-            if self.spec.key not in served:
-                raise JudgeUnreachable(
-                    f"{self.base_url} is serving {served}, which does not include "
-                    f"{self.spec.key!r}. Something is on this port, but it is not the "
-                    f"{self.key} judge -- most likely another judge from the GPU 2 "
-                    f"rotation, or a serve command whose --served-model-name does not "
-                    f"match config.JUDGE_MODELS.\n\n"
-                    f"Expected command:\n\n{serve_hint(self.spec)}"
-                )
-            self._preflight_result = {"base_url": self.base_url, "served": served}
+            await check_server(self.client, self.spec, self.base_url)
+            self._preflight_result = {"base_url": self.base_url}
             return self._preflight_result
 
     async def aclose(self) -> None:
@@ -347,15 +308,7 @@ class RubricJudge(_Judge):
         return (completion.choices[0].message.content or "").strip()
 
     async def _server_version(self) -> str:
-        """Best-effort vLLM version, for the diagnostic. Never raises."""
-        try:
-            import httpx  # transitive via openai; diagnostics only
-
-            root = str(self.client.base_url).rstrip("/").removesuffix("/v1")
-            async with httpx.AsyncClient(timeout=10) as http:
-                return (await http.get(f"{root}/version")).json().get("version", "?")
-        except Exception:  # a failed version lookup must never mask the real error
-            return "unknown"
+        return await server_version(self.client, self.base_url)
 
     async def assert_constrained(self) -> dict:
         """Prove the server constrains decodes, before any verdict is counted.

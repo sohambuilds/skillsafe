@@ -172,7 +172,20 @@ that happen to share a battery, and a split result is a null under §8.5 anyway.
 
 ---
 
-## 5. Gate A prediction, recorded before Gate A runs
+## 5. Gate A prediction — VOID as computed, see the correction below
+
+> **Correction, 2026-08-29.** The table below was computed against the `inert_k0` base
+> rates. `gate_a()` uses **`opt_k0` (= `skills/seed.md`)** as its baseline, deliberately:
+> `build_planted_skills()` writes each planted instrument as literally seed.md plus one
+> policy block, so comparing against seed.md subtracts everything except that block.
+> Comparing against `inert_k0` would confound the block with the procedural-vs-
+> descriptive difference, which §2 above shows is worth up to 68 points.
+>
+> The safe-arm refusal rate under `opt_k0` has not been measured, so the headroom, the
+> regime and the arm-swap flag below are all computed from the wrong condition and none
+> of them stand. Left in place rather than rewritten, because silently re-deriving a
+> prediction after it failed is the retro-fitting §2 forbids. No replacement prediction
+> is offered until `opt_k0` is rolled out — there is nothing to base one on.
 
 Derived from the `inert_k0` base rates and the constants in `src/config.py`
 (`GATE_A_HEADROOM_REGIME_THRESHOLD_PP = 25.0`, `GATE_A_MIN_HEADROOM_FRACTION = 0.50`):

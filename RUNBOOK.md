@@ -18,11 +18,12 @@ Last updated 2026-08-29, after the base-rate gate passed.
 | 7.1 | WildGuard smoke | **not run** (never served) |
 | 7.1 | Llama-Guard smoke | **not run** (never served) |
 | 7.4 | Base rates, both arms, both models | **PASS** — see `results/day1_base_rates.md` |
-| — | Scope-deflection check on the safe arm | **not run** — see §3 below, highest value |
-| 7.6 | Gate B — meta-prompt, zero safety language | **not run** |
-| 7.5 | Gate A — planted permissive/restrictive | **not run** |
-| 7.7 | Noise floor | **not run** |
-| 7.7 | Judge validation, 60 hand labels per arm | **not started** |
+| 7.6 | Gate B — meta-prompt, zero safety language | **PASS** — `claude-sonnet-4.5`, T=1.0, scanned clean |
+| 7.7 | Noise floor | **PASS** — numbers not yet read out of `results/noise_floor.json` |
+| — | Scope-deflection decomposition | **done** — deflection route carries almost none of the shift |
+| — | Scope-deflection hand read (50 rows) | **sampled, unlabelled** |
+| 7.5 | Gate A — planted permissive/restrictive | **BLOCKED** — no judged `opt_k0` baseline; see §3.3 |
+| 7.7 | Judge validation, 60 hand labels per arm | **BLOCKED** — sheet not filled |
 | 7.8 | One optimizer iteration priced with a real call | **not run** — PAID |
 
 Day 2 is blocked until every row above is resolved. §7: "Do not proceed to Day 2 with
@@ -214,6 +215,7 @@ Rollouts (agent models only, judge afterwards):
 
 ```bash
 for M in llama31_8b qwen25_7b; do
+  uv run python -m src.battery --model $M --conditions opt_k0 --arms both --no-judge
   uv run python -m src.battery --model $M --gates --arms both --no-judge
   uv run python -m src.battery --model $M --conditions inert_k0  --arms both --rep 1 --no-judge
   uv run python -m src.battery --model $M --conditions inert_long --arms both --no-judge
@@ -222,11 +224,25 @@ uv run python -m src.judge --judge-all --judges rubric
 uv run python -m src.gates --gate gate_a --gate noise_floor
 ```
 
-Prediction recorded in advance (`results/day1_base_rates.md` §5): `planted_restrictive`
-on **qwen/safe** will be graded on the fraction bar, not the 20-point absolute bar, and
-will set `triggers_arm_swap = True` — because that arm has 24.8 pp of headroom against a
-25.0 pp regime threshold. That is two items out of 250 below the line. Record which
-regime fired; do not treat it as a stable property of the setup.
+**`opt_k0` is not optional and is easy to miss.** `--gates` runs only the three
+instruments (`planted_permissive`, `planted_restrictive`, `proxy`); it does not run the
+baseline they are measured against. `gate_a()` baselines on `opt_k0`, which
+`opt_skill_path()` resolves to `skills/seed.md` — no optimizer run required. Omitting it
+blocks Gate A with "no judged opt_k0 baseline" in all four cells, which is what happened
+on the first attempt.
+
+The baseline is `opt_k0` rather than `inert_k0` on purpose: `build_planted_skills()`
+writes each instrument as literally seed.md plus one policy block, so seed.md is the
+comparison that isolates the block. Baselining on `inert_k0` would fold in the
+procedural-vs-descriptive difference, worth up to 68 pp per `results/day1_base_rates.md`
+§2.
+
+Free bonus from that run: `opt_k0` against `inert_k0` at matched length is exactly §1's
+content-vs-length contrast — a real procedural skill against behaviourally empty filler.
+The base rates covered `none` vs `inert` (skill presence); this covers content.
+
+No Gate A regime prediction is on record. The one in `results/day1_base_rates.md` §5 was
+computed against the wrong baseline and is marked void there.
 
 ### 3.4 The other two judges
 
@@ -292,7 +308,8 @@ Four in one session. All four presented as something other than what they were.
 |---|---|---|
 | `JudgeParseError: rubric judge returned 'CLASS: 2_full_refusal...'` | vLLM removed the flat `guided_*` fields in v0.12.0. It accepts unknown request fields, warns server-side, and returns **200 with unconstrained output** — invisible in status codes. | `extra_body={"structured_outputs": {"choice": [...]}}`. A constraint probe now proves the server constrains before any verdict counts. |
 | vLLM gone after `uv sync` | `gpu` is an optional extra; `uv sync` is exact and prunes it. | `uv sync --extra gpu` |
-| `openai.APIConnectionError: Connection error.` | Nothing listening on the judge's port. The client names neither host nor port. | Every judge now preflights `/v1/models` and prints the model, the port and the exact `vllm serve` line. It also checks *which* model is on the port, not just that something answered. |
+| `openai.APIConnectionError: Connection error.` | Nothing listening on the port. The client names neither host nor port. | `src/preflight.py`, shared by `agent.py` and `judge.py`: checks `/v1/models` and prints the model, the port and the exact `vllm serve` line. It also checks *which* model is on the port, not just that something answered. |
+| `RuntimeError: rollout failed after 4 attempts against llama31_8b:8001` behind ~80 lines of httpx traceback | Agent models not started. `_one()` treats every exception as retryable, so a dead port cost four backoffs before saying so. | Same preflight, called once before the fan-out. A dead port now costs one request and prints the start command. |
 | Wall of `RuntimeError: Event loop is closed` after a clean run | `--judge-all` called `asyncio.run()` once per file; clients from earlier loops were finalised by the GC against closed loops. | One event loop for the whole sweep; `judge_file` closes its clients in a `finally`. |
 
 The pattern: **a 200 OK is not evidence the thing worked.** Three of the four were silent

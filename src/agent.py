@@ -31,6 +31,7 @@ from pathlib import Path
 from src import config, grading
 from src.config import ModelSpec
 from src.io_utils import append_jsonl, base_record, done_ids, read_jsonl, run_path
+from src.preflight import check_server
 
 
 def render_table(table: dict) -> tuple[str, dict]:
@@ -157,11 +158,8 @@ async def run_rollouts(
     if not pending:
         return read_jsonl(out_path)
 
-    client = AsyncOpenAI(
-        base_url=base_url or f"http://localhost:{spec.port}/v1",
-        api_key="EMPTY",
-        timeout=600,
-    )
+    url = base_url or f"http://localhost:{spec.port}/v1"
+    client = AsyncOpenAI(base_url=url, api_key="EMPTY", timeout=600)
     semaphore = asyncio.Semaphore(config.CLIENT_CONCURRENCY)
 
     built = []
@@ -172,10 +170,22 @@ async def run_rollouts(
             user_content, extra = item["prompt"], {}
         built.append((item, build_messages(skill_text, user_content), extra))
 
-    completions = await asyncio.gather(
-        *(_one(client, spec, messages, temperature, max_tokens, semaphore)
-          for _, messages, _ in built)
-    )
+    try:
+        # Before any rollout, not four retries deep. A dead port is not a transient
+        # transport error, so _one()'s exponential backoff just delays the same answer
+        # behind eighty lines of httpx traceback. check_server() also catches the
+        # quieter fault: a live server on this port answering for a DIFFERENT model.
+        await check_server(client, spec, url)
+        completions = await asyncio.gather(
+            *(_one(client, spec, messages, temperature, max_tokens, semaphore)
+              for _, messages, _ in built)
+        )
+    finally:
+        # Release the pool on the loop that opened it; see judge._Judge.aclose().
+        try:
+            await client.close()
+        except Exception:  # teardown must never mask the real outcome
+            pass
 
     records = []
     for (item, messages, extra), completion in zip(built, completions):
